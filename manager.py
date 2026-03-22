@@ -3,6 +3,7 @@ from datetime import datetime, timedelta
 from typing import Any, Dict, Optional, Tuple, cast
 from sqlalchemy import Engine
 from sqlmodel import Session, select, desc
+from loguru import logger
 
 # 导入你刚才定义的模型
 from models import User, WarningRecord 
@@ -19,11 +20,12 @@ class ModManager:
                 config = tomllib.load(f)
                 return config.get(item) if item else config
         except (FileNotFoundError, tomllib.TOMLDecodeError) as e:
-            print(f"ERROR Loading Config: {e}")
+            logger.critical(f"ERROR Loading Config: {e}")
             return None
 
     def is_muted(self, user_id: int) -> Tuple[bool, Optional[float]]:
         """检查用户是否被禁言"""
+        logger.debug("This user has been checked for account suspension status.", {"user_id": user_id})
         with Session(self.engine) as session:
             user = session.get(User, user_id)
             if not user or not user.is_muted:
@@ -31,6 +33,7 @@ class ModManager:
             
             # 检查是否过期
             if user.mute_until:
+                logger.success(f"User {user_id} has been automatically unmuted.")
                 if datetime.now() > user.mute_until:
                     # 自动解封
                     user.is_muted = False
@@ -46,6 +49,9 @@ class ModManager:
     def warn_user(self, user_id: int, rule_id: str, reason: str = "No reason provided") -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
         """警告用户并计算禁言"""
 
+        logger.debug(f"User {user_id} has been warned according to rule {rule_id}.")
+
+        
         rules = self.rules
         if not rules:
             return None, "Rules not loaded"
@@ -73,11 +79,13 @@ class ModManager:
             if not user:
                 user = User(zulip_id=user_id, username=f"User_{user_id}")
                 session.add(user)
+                logger.success(f"User {user_id} has been created automatically.")
             
             # 3. 增加警告记录
             new_warn = WarningRecord(type=rule_id, reason=reason, user_id=user_id)
             session.add(new_warn)
             session.flush() # 刷新以获取最新状态，但不提交
+
 
             # 4. 计算该类型的警告总数 (x)
             statement = select(WarningRecord).where(
@@ -110,10 +118,12 @@ class ModManager:
                 }, None
             except Exception as e:
                 session.rollback()
+                logger.error("Unable to warn users because " + str(e))
                 return None, str(e)
 
     def unmute(self, user_id: int):
         """手动解除禁言"""
+        
         with Session(self.engine) as session:
             user = session.get(User, user_id)
             if user and user.is_muted:
@@ -121,6 +131,7 @@ class ModManager:
                 user.mute_until = None
                 session.add(user)
                 session.commit()
+                logger.success(f"User {user_id} has been unmuted.")
                 return True
             return False
     def unwarn_user(self, user_id: int, rule_id: str) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
@@ -155,6 +166,7 @@ class ModManager:
                 session.add(user)
 
             session.commit()
+            logger.success(f"User {user_id} has been unwarned.")
             
             # 5. 获取规则名称用于返回
             cat, sub = rule_id.split(".")
@@ -180,6 +192,7 @@ class ModManager:
             
             session.add(user)
             session.commit()
+            logger.success(f"User {user_id} has been muted for {seconds} seconds")
     def parse_time(self, time_str: str) -> Tuple[Optional[int], str]:
         """
         解析时间字符串，返回 (秒数, 标签)

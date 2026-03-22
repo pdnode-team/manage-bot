@@ -1,6 +1,6 @@
 from datetime import datetime
-from typing import List, Optional
-from sqlmodel import Field, SQLModel, Relationship, create_engine
+from typing import Any, Dict, List, Optional
+from sqlmodel import JSON, Field, SQLModel, Relationship, create_engine, Column
 
 # 定义用户表
 class User(SQLModel, table=True):
@@ -20,6 +20,14 @@ class WarningRecord(SQLModel, table=True):
     user_id: int = Field(foreign_key="user.zulip_id")
     user: User = Relationship(back_populates="warnings")
 
+class AuditLog(SQLModel, table=True):
+    id: int = Field(default=None, primary_key=True)
+    zulip_id: int = Field(index=True, default=None)
+    target_id: Optional[int] = Field(index=True, default=None)
+    action: str = Field(default=None, index=True)
+    extra_data: Optional[Dict[str, Any]] = Field(default=None, sa_column=Column(JSON))
+    created_at: datetime = Field(default_factory=datetime.now)
+
 
 sqlite_url = "sqlite:///database.db"
 engine = create_engine(sqlite_url, echo=True)
@@ -28,6 +36,9 @@ def create_db_and_tables():
     print("Attempting to create a table")
     SQLModel.metadata.create_all(engine)
     print("表创建指令已发送。")
+
+
+    
 
 # 3. 必须有这一步调用！
 if __name__ == "__main__":
