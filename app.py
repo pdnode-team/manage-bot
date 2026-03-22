@@ -1,3 +1,4 @@
+from loguru import logger
 import zulip
 import time
 import os
@@ -34,7 +35,7 @@ def get_user_info(name_or_id: str | int):
         for m in users["members"]:
             if m["full_name"] == name_or_id or str(m["user_id"]) == str(name_or_id):
                 return m["role"], m["user_id"], m["full_name"]
-    print(f"ERROR: Cannot find user: {name_or_id}")
+    logger.error(f"ERROR: Cannot find user: {name_or_id}")
     return 400, -1, "Unknown"
 
 
@@ -93,7 +94,7 @@ def check_openai(text: str):
                 )
                 return True, cat
     except Exception as e:
-        print(f"❌ OpenAI Error: {e}")
+        logger.error(f"❌ OpenAI Error: {e}")
     return False, None
 
 
@@ -119,7 +120,7 @@ def check_deepseek(text: str):
         )
         return json.loads(cast(str, resp.choices[0].message.content))
     except Exception as e:
-        print(f"❌ DeepSeek Error: {e}")
+        logger.error(f"❌ DeepSeek Error: {e}")
         return {"flagged": False}
 
 
@@ -311,7 +312,7 @@ def handle_message(msg: Dict[str, Any]):
 
 if __name__ == "__main__":
     try:
-        print("🛡 Pdnode Manage Bot v6.0 started...")
+        logger.info("🛡 Pdnode Manage Bot v6.0 started...")
         client.call_on_each_message(handle_message)
     except KeyboardInterrupt:
         print("\nBye bye.")
