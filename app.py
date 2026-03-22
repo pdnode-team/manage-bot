@@ -312,7 +312,7 @@ def handle_message(msg: Dict[str, Any]):
 
 if __name__ == "__main__":
     try:
-        logger.info("🛡 Pdnode Manage Bot v6.0 started...")
+        logger.info("🛡 Pdnode Manage Bot v6.1 (Beta) started...")
         client.call_on_each_message(handle_message)
     except KeyboardInterrupt:
         print("\nBye bye.")
