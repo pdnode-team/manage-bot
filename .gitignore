@@ -1,0 +1,66 @@
+# --- Python 核心 ---
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# --- 虚拟环境 ---
+.venv/
+venv/
+ENV/
+env.bak/
+venv.bak/
+
+# --- 敏感信息 ---
+.env
+.venv
+*.secrets
+auth.json
+zuliprc
+
+# --- 数据库 ---
+*.db
+*.sqlite3
+*.sqlite
+
+# --- IDE & 编辑器 ---
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.helix/
+.project
+.pydevproject
+.settings/
+
+# --- 日志 ---
+*.log
+logs/
+
+# --- 单元测试 ---
+.pytest_cache/
+.nosepycache
+.coverage
+htmlcov/
+.tox/
+.nox/
