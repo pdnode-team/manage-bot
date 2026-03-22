@@ -1,126 +1,242 @@
-import json
-import os
-import time
-import re
+import tomllib
+from datetime import datetime, timedelta
+from typing import Any, Dict, Optional, Tuple, cast
+from sqlalchemy import Engine
+from sqlmodel import Session, select, desc
 
+# 导入你刚才定义的模型
+from models import User, WarningRecord 
 
 class ModManager:
-    def __init__(self):
-        self.mutes_file = "mutes.json"
-        self.warns_file = "warns.json"
-        self.rules_file = "rules.json"
-        self.mutes = self._load(self.mutes_file, {})
-        self.warns = self._load(self.warns_file, {})
-        self.rules = self._load(self.rules_file, {})
+    def __init__(self, engine: Engine):
+        self.engine = engine
+        raw_rules = self._load_config("rules")
+        self.rules: Dict[str, Any] = raw_rules if isinstance(raw_rules, dict) else {}
 
-    def _load(self, path, default):
-        if os.path.exists(path):
-            with open(path, "r") as f:
-                try:
-                    return json.load(f)
-                except Exception:
-                    return default
-        return default
+    def _load_config(self, item: str = ""):
+        try:
+            with open("config.toml", "rb") as f:
+                config = tomllib.load(f)
+                return config.get(item) if item else config
+        except (FileNotFoundError, tomllib.TOMLDecodeError) as e:
+            print(f"ERROR Loading Config: {e}")
+            return None
 
-    def _save(self, path, data):
-        with open(path, "w") as f:
-            json.dump(data, f, indent=4)
+    def is_muted(self, user_id: int) -> Tuple[bool, Optional[float]]:
+        """检查用户是否被禁言"""
+        with Session(self.engine) as session:
+            user = session.get(User, user_id)
+            if not user or not user.is_muted:
+                return False, None
+            
+            # 检查是否过期
+            if user.mute_until:
+                if datetime.now() > user.mute_until:
+                    # 自动解封
+                    user.is_muted = False
+                    user.mute_until = None
+                    session.add(user)
+                    session.commit()
+                    return False, None
+                return True, user.mute_until.timestamp()
+            
+            # 如果 is_muted 为 True 但没有时间，则是永久禁言 (-1)
+            return True, -1
 
-    def is_muted(self, user_id):
-        uid = str(user_id)
-        if uid in self.mutes:
-            exp = self.mutes[uid]
-            if exp == -1 or time.time() < exp:
-                return True, exp
-            del self.mutes[uid]
-            self._save(self.mutes_file, self.mutes)
-        return False, None
+    def warn_user(self, user_id: int, rule_id: str, reason: str = "No reason provided") -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
+        """警告用户并计算禁言"""
 
-    def parse_time(self, time_str):
-        if time_str == "always":
-            return -1, "forever"
-        time_match = re.match(r"^(\d+)(m|h|d|mo|y)$", time_str.lower())
-        if not time_match:
-            return None, None
+        rules = self.rules
+        if not rules:
+            return None, "Rules not loaded"
 
-        val, unit = int(time_match.group(1)), time_match.group(2)
-        mapping = {
-            "m": (60, "minutes"),
-            "h": (3600, "hours"),
-            "d": (86400, "days"),
-            "mo": (2592000, "months"),
-            "y": (31536000, "years"),
-        }
-        secs, label = mapping[unit]
-        return val * secs, f"{val} {label}"
-
-    def warn_user(self, user_id, rule_id):
-        uid, rid = str(user_id), str(rule_id)
-        if rid not in self.rules:
-            return None, "Rule ID not found."
-
-        if uid not in self.warns:
-            self.warns[uid] = {}
-        self.warns[uid][rid] = self.warns[uid].get(rid, 0) + 1
-        x = self.warns[uid][rid]
+        parts = rule_id.split(".")
+        if len(parts) != 2:
+            return None, "Invalid Rule ID"
+        category, sub_id = parts
 
         try:
-            minutes = eval(self.rules[rid]["formula"], {"x": x})
-            expiry = (
-                (time.time() + minutes * 60)
-                if minutes > 0
-                else (None if minutes == 0 else -1)
+            # 2. 核心修复：直接用 ['key'] 访问并 cast，跳过 .get() 的重载推导
+            # 因为你已经处理了 KeyError，所以直接索引更干净
+            cat_data = cast(Dict[str, Any], rules[category])
+            rule = cast(Dict[str, Any], cat_data[sub_id])
+            
+            # 如果走到这一步，rule_data 就是一个纯净的 Dict[str, Any]
+            # Pylance 不再会有任何抱怨
+            
+        except (KeyError, TypeError):
+            return None, f"Rule {rule_id} not found"
+
+        with Session(self.engine) as session:
+            # 2. 获取或创建用户
+            user = session.get(User, user_id)
+            if not user:
+                user = User(zulip_id=user_id, username=f"User_{user_id}")
+                session.add(user)
+            
+            # 3. 增加警告记录
+            new_warn = WarningRecord(type=rule_id, reason=reason, user_id=user_id)
+            session.add(new_warn)
+            session.flush() # 刷新以获取最新状态，但不提交
+
+            # 4. 计算该类型的警告总数 (x)
+            statement = select(WarningRecord).where(
+                WarningRecord.user_id == user_id, 
+                WarningRecord.type == rule_id
             )
-            if expiry:
-                self.mutes[uid] = expiry
-            self._save(self.mutes_file, self.mutes)
-            self._save(self.warns_file, self.warns)
+            x = len(session.exec(statement).all())
+
+            try:
+                # 5. 计算禁言时长
+                formula = rule.get("formula", "0")
+                minutes = eval(formula, {"x": x})
+                
+                if minutes != 0:
+                    user.is_muted = True
+                    if minutes > 0:
+                        # 限时禁言
+                        user.mute_until = datetime.now() + timedelta(minutes=minutes)
+                    else:
+                        # 永久禁言 (如果是 -1)
+                        user.mute_until = None
+                
+                session.add(user)
+                session.commit()
+
+                return {
+                    "count": x,
+                    "mute_mins": minutes,
+                    "name": rule["name"],
+                }, None
+            except Exception as e:
+                session.rollback()
+                return None, str(e)
+
+    def unmute(self, user_id: int):
+        """手动解除禁言"""
+        with Session(self.engine) as session:
+            user = session.get(User, user_id)
+            if user and user.is_muted:
+                user.is_muted = False
+                user.mute_until = None
+                session.add(user)
+                session.commit()
+                return True
+            return False
+    def unwarn_user(self, user_id: int, rule_id: str) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
+        """撤销用户最后一次针对该规则的警告"""
+        with Session(self.engine) as session:
+            # 1. 查找该用户该类型最近的一条警告 (按 ID 倒序)
+            statement = select(WarningRecord).where(
+                WarningRecord.user_id == user_id,
+                WarningRecord.type == rule_id
+            ).order_by(desc(WarningRecord.id))
+            
+            last_warning = session.exec(statement).first()
+            
+            if not last_warning:
+                return None, "User has no warning records for this rule."
+
+            # 2. 删除这条记录
+            session.delete(last_warning)
+            
+            # 3. 重新统计剩余警告总数 (x)
+            count_stmt = select(WarningRecord).where(
+                WarningRecord.user_id == user_id,
+                WarningRecord.type == rule_id
+            )
+            new_x = len(session.exec(count_stmt).all())
+            
+            # 4. (可选) 如果警告清零，自动解除禁言状态
+            user = session.get(User, user_id)
+            if user and new_x == 0:
+                user.is_muted = False
+                user.mute_until = None
+                session.add(user)
+
+            session.commit()
+            
+            # 5. 获取规则名称用于返回
+            cat, sub = rule_id.split(".")
+            rule_name = cast(Dict[str, Any], self.rules.get(cat, {})).get(sub, {}).get("name", "Unknown")
+
             return {
-                "count": x,
-                "mute_mins": minutes,
-                "name": self.rules[rid]["name"],
-            }, None
-        except Exception as e:
-            return None, str(e)
-
-    def unwarn_user(self, user_id, rule_id):
-        uid, rid = str(user_id), str(rule_id)
-        if rid not in self.rules:
-            return None, "Rule ID not found."
-
-        if uid not in self.warns:
-            return None, "User never be warned"
-        self.warns[uid][rid] = max(0, self.warns[uid].get(rid, 0) - 1)
-        x = self.warns[uid][rid]
-
-        try:
-            # minutes = eval(self.rules[rid]["formula"], {"x": x})
-            # expiry = (
-            #    (time.time() + minutes * 60)
-            #    if minutes > 0
-            #    else (None if minutes == 0 else -1)
-            # )
-            # if expiry:
-            #    self.mutes[uid] = expiry
-            # self._save(self.mutes_file, self.mutes)
-            self._save(self.warns_file, self.warns)
-            return {
-                "count": x,
+                "count": new_x,
                 "mute_mins": 0,
-                "name": self.rules[rid]["name"],
+                "name": rule_name,
             }, None
-        except Exception as e:
-            return None, str(e)
-
-    def set_mute(self, user_id, seconds):
-        uid = str(user_id)
-        self.mutes[uid] = -1 if seconds == -1 else (time.time() + seconds)
-        self._save(self.mutes_file, self.mutes)
-
-    def unmute(self, user_id):
-        uid = str(user_id)
-        if uid in self.mutes:
-            del self.mutes[uid]
-            self._save(self.mutes_file, self.mutes)
-            return True
-        return False
+    def set_mute(self, user_id: int, seconds: int):
+        """手动设置禁言时间 (-1 为永久)"""
+        with Session(self.engine) as session:
+            user = session.get(User, user_id)
+            if not user:
+                user = User(zulip_id=user_id, username=f"User_{user_id}")
+            
+            user.is_muted = True
+            if seconds == -1:
+                user.mute_until = None # 永久禁言
+            else:
+                user.mute_until = datetime.now() + timedelta(seconds=seconds)
+            
+            session.add(user)
+            session.commit()
+    def parse_time(self, time_str: str) -> Tuple[Optional[int], str]:
+        """
+        解析时间字符串，返回 (秒数, 标签)
+        支持: 10s, 30m, 1h, 1d, always
+        """
+        import re
+        
+        ts = time_str.lower().strip()
+        
+        # 处理永久禁言
+        if not ts or ts in ["always", "forever", "inf", "-1"]:
+            return -1, "forever"
+            
+        # 使用正则匹配数字和单位 (s, m, h, d)
+        match = re.match(r"^(\d+)\s*([smhd]?)$", ts)
+        if not match:
+            return None, "invalid format"
+            
+        val_str, unit = match.groups()
+        val = int(val_str)
+        
+        # 默认单位是分钟 (m)，如果没写单位的话
+        multipliers = {
+            "s": 1,
+            "m": 60,
+            "": 60,   # 默认分钟
+            "h": 3600,
+            "d": 86400
+        }
+        
+        seconds = val * multipliers.get(unit, 60)
+        label = f"{val}{unit if unit else 'm'}"
+        
+        return seconds, label
+    def get_all_mutes(self) -> Dict[int, float]:
+        """从数据库获取所有被禁言的用户 ID 和过期时间"""
+        with Session(self.engine) as session:
+            # 查询所有 is_muted 为 True 的用户
+            statement = select(User).where(User.is_muted == True)
+            users = session.exec(statement).all()
+            
+            # 返回一个字典 {user_id: timestamp}
+            # 如果是永久禁言，timestamp 设为 -1.0
+            return {
+                u.zulip_id: (u.mute_until.timestamp() if u.mute_until else -1.0)
+                for u in users
+            }
+        
+    def get_user_status(self, user_id: int) -> Dict[str, int]:
+        """获取特定用户的所有警告统计"""
+        with Session(self.engine) as session:
+            statement = select(WarningRecord).where(WarningRecord.user_id == user_id)
+            results = session.exec(statement).all()
+            
+            # 统计每种规则的次数
+            # 返回格式如: {"1.1": 2, "2.1": 1}
+            stats: Dict[str, int] = {}
+            for record in results:
+                stats[record.type] = stats.get(record.type, 0) + 1
+            return stats

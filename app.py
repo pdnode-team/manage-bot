@@ -8,7 +8,11 @@ from openai import OpenAI
 from functools import lru_cache
 from dotenv import load_dotenv
 from manager import ModManager
-from typing import cast
+from typing import Any, Dict, Optional, cast
+from sqlmodel import create_engine
+
+sqlite_url = "sqlite:///database.db"
+engine = create_engine(sqlite_url)
 
 load_dotenv()
 
@@ -18,41 +22,62 @@ deepseekClient = OpenAI(
     api_key=os.getenv("DEEPSEEK_API_KEY"), base_url="https://api.deepseek.com"
 )
 client = zulip.Client(config_file="zuliprc")
-mgr = ModManager()
+mgr = ModManager(engine)
 BOT_EMAIL = "manage-bot@chat.p67.click"
 
 
 # --- 2. 工具函数 ---
 @lru_cache(maxsize=128)
-def get_user_info(name_or_id):
+def get_user_info(name_or_id: str | int):
     users = client.get_users()
     if users.get("result") == "success":
         for m in users["members"]:
             if m["full_name"] == name_or_id or str(m["user_id"]) == str(name_or_id):
                 return m["role"], m["user_id"], m["full_name"]
-    return 400, None, "Unknown"
+    print(f"ERROR: Cannot find user: {name_or_id}")
+    return 400, -1, "Unknown"
 
 
-def send_custom(msg, content, to=None, topic=None):
-    m_type = msg["type"] if msg else "stream"
+def send_custom(
+    msg: Optional[Dict[str, Any]], 
+    content: str, 
+    to: Optional[str | int | list[int]] = None, # 允许接收 ID(int) 或 名字(str)
+    topic: Optional[str] = None
+):
+    # 1. 确定消息类型，如果 msg 为空，默认发往 stream
+    m_type = msg.get("type", "stream") if msg else "stream"
+    
+    # 2. 如果没有指定接收者 'to'，则从 msg 中提取
     if not to:
-        to = msg["display_recipient"] if m_type == "stream" else msg["sender_id"]
-    if m_type == "stream" and not topic:
-        topic = msg.get("subject", "notification")
+        if msg:
+            # Pylance 现在知道这里 msg 绝对不是 None
+            to = msg["display_recipient"] if m_type == "stream" else msg["sender_id"]
+        else:
+            # 如果连 msg 都没有，必须给一个默认的频道名，否则发送会失败
+            to = "moderators" 
 
-    request = {
+    # 3. 确定 Topic
+    if m_type == "stream" and not topic:
+        # 使用 .get 避开 None 属性报错
+        topic = msg.get("subject", "notification") if msg else "notification"
+
+    # 4. 构造请求
+    # 注意：Zulip 私聊的 'to' 通常需要是 List[int]
+    request: Dict[str, Any] = {
         "type": m_type,
-        "to": [to] if m_type == "private" else to,
+        "to": to,
         "content": content,
     }
+    
     if m_type == "stream":
         request["topic"] = topic
+        
     return client.send_message(request)
 
 
 # --- 3. AI 审核引擎 ---
 @lru_cache(maxsize=1024)
-def check_openai(text):
+def check_openai(text: str):
     if len(text.strip()) < 2:
         return False, None
     norm = unicodedata.normalize("NFKC", text)
@@ -72,7 +97,7 @@ def check_openai(text):
     return False, None
 
 
-def check_deepseek(text):
+def check_deepseek(text: str):
     try:
         resp = deepseekClient.chat.completions.create(
             model="deepseek-chat",
@@ -99,15 +124,17 @@ def check_deepseek(text):
 
 
 # --- 4. 消息处理 ---
-def handle_message(msg):
-    sender_id = msg.get("sender_id")
+def handle_message(msg: Dict[str, Any]):
+
+    sender_id: int = cast(int, msg.get("sender_id"))
     sender_name = msg.get("sender_full_name")
     content = msg.get("content", "").strip()
+    
     if msg.get("sender_email") == BOT_EMAIL:
         return
 
     # A. 禁言拦截
-    muted, exp = mgr.is_muted(sender_id)
+    muted, _ = mgr.is_muted(sender_id)
     if muted and sender_id != 8:
         client.delete_message(msg["id"])
         return
@@ -120,17 +147,21 @@ def handle_message(msg):
         match = re.search(r"@\*\*(.*?)(?:\|\d+)?\*\*", content)
         cmd = content.split()[0].lower()
 
-        # 特殊：/status all 无需提及用户
+        # 特殊：/status all
         if cmd == "/status" and "all" in content:
+            # 获取实时数据库数据
+            active_mutes = mgr.get_all_mutes() 
+            
             m_list = [
-                f"- @**{get_user_info(u)[2]}**: {'Forever' if e == -1 else f'{int((e - time.time()) / 60)}m left'}"
-                for u, e in mgr.mutes.items()
+                f"- @**{get_user_info(u)[2]}**: {'Forever' if e == -1.0 else f'{int((e - time.time()) / 60)}m left'}"
+                for u, e in active_mutes.items()
             ]
+            
             send_custom(
-                msg, "🔇 **Mutes:**\n" + ("\n".join(m_list) if m_list else "None")
+                msg, "🔇 **Current Mutes:**\n" + ("\n".join(m_list) if m_list else "None")
             )
             return
-
+        
         elif cmd == "/clear-cache" and not s_role > 300:
             get_user_info.cache_clear()  # 手动清空所有已缓存的角色信息
             check_openai.cache_clear()
@@ -140,8 +171,14 @@ def handle_message(msg):
         if not match:
             return
 
+        t_name: str
+        t_role: int
+        t_id: int
         t_name = match.group(1).strip()
         t_role, t_id, _ = get_user_info(t_name)
+
+        if t_id == -1:
+            return
 
         # 权限检查
         if cmd in ["/mute", "/unmute", "/warn", "/unwarn"]:
@@ -209,20 +246,22 @@ def handle_message(msg):
                 )
 
         elif cmd == "/status":
-            data = mgr.warns.get(str(t_id), {})
+            # 1. 明确获取带类型的字典
+            data = mgr.get_user_status(t_id)
+            
+            # 2. 现在 data 确定是 Dict[str, int]，.items() 就不再是 Unknown 了
             status_txt = (
-                ", ".join([f"R{k}: {v}" for k, v in data.items()])
+                ", ".join([f"**{k}**: {v}" for k, v in data.items()])
                 if data
                 else "No warns"
             )
             send_custom(msg, f"📊 @**{t_name}**: {status_txt}")
-        return
 
     if s_role <= 300:
         return
 
     # C. AI 审计 (雷达模式)
-    flagged, reason = check_openai(content)
+    flagged, _ = check_openai(content)
     if flagged:
         # 发送初步告警
         # stream_id = msg.get("stream_id", "")
@@ -272,7 +311,7 @@ def handle_message(msg):
 
 if __name__ == "__main__":
     try:
-        print("🛡 Pdnode Ultimate Bot v5.0 (Full Logic) started...")
+        print("🛡 Pdnode Manage Bot v6.0 started...")
         client.call_on_each_message(handle_message)
     except KeyboardInterrupt:
         print("\nBye bye.")

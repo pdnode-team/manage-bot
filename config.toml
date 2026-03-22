@@ -1,0 +1,32 @@
+
+# ==========================
+#           Rules
+# ==========================
+# Formula ex: x * 5
+[rules.1.1]
+name = "Disrespectful"
+formula = "0"
+[rules.1.2]
+name = "Bad Words"
+formula = "0"
+[rules.1.3]
+name = "Mentions Abuse"
+formula = "0"
+[rules.1.4]
+name = "Spamming"
+formula = "0"
+[rules.2.1]
+name = "School Policy/BSD48"
+formula = "0"
+[rules.2.2]
+name = "Impersonating Staff"
+formula = "0"
+[rules.2.3]
+name = "Privacy Violation"
+formula = "0"
+[rules.3.1]
+name = "Username Policy"
+formula = "0"
+[rules.3.2]
+name = "System Abuse"
+formula = "0"
