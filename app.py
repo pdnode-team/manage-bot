@@ -1169,6 +1169,7 @@ NO_MENTION_COMMANDS = {
     "/clear-cache": cmd_clear_cache,
     "/new-rules-need-allow": cmd_new_rules_need_allow,
     "/agree-new-rules": cmd_agree_new_rules,
+    "/agree-with-rules": cmd_agree_new_rules,
     "/end-new-rules": cmd_end_new_rules,
     # auto-rule commands handled inline in handle_message
 }
@@ -1196,22 +1197,14 @@ AUTO_RULE_CMDS = {"/create-rule", "/update-rule", "/delete-rule", "/check-rule",
 # ─── 6. Message Handler ───
 
 def handle_message(msg: Dict[str, Any]):
-    # Restrict to #Bot stream (id=32) or DMs. Other streams are ignored.
-    is_pm = msg.get("type") == "private"
-    is_bot_stream = (
-        msg.get("type") == "stream" and msg.get("stream_id") == NOTIFICATION_STREAM_ID
-    )
-    if not (is_pm or is_bot_stream):
+    if msg.get("sender_email") == BOT_EMAIL:
         return
 
     sender_id: int = cast(int, msg.get("sender_id"))
     sender_name = msg.get("sender_full_name")
     content: str = msg.get("content", "").strip()
 
-    if msg.get("sender_email") == BOT_EMAIL:
-        return
-
-    # A. Mute check
+    # A. Mute check (Global: applies to all streams and DMs)
     muted, _ = mgr.is_muted(sender_id)
     if muted:
         s_role, _, _, _ = get_user_info(sender_id)
@@ -1221,25 +1214,88 @@ def handle_message(msg: Dict[str, Any]):
     else:
         s_role, _, _, _ = get_user_info(sender_id)
 
-    # A5. New rules lockdown check
+    # A5. New rules lockdown check (Global: applies to all streams and DMs)
     if mgr.is_new_rules_active():
         if not mgr.has_agreed_new_rules(sender_id):
-            cmd = content.split()[0].lower()
-            # Allow /agree-new-rules (and the admin command) to pass through
-            if cmd not in ("/agree-new-rules", "/new-rules-need-allow") and sender_id not in mgr.bot_ids:
+            cmd = content.split()[0].lower() if content else ""
+            # Allow /agree-new-rules, /agree-with-rules, and admin commands to pass through
+            if (
+                cmd not in ("/agree-new-rules", "/agree-with-rules", "/new-rules-need-allow", "/end-new-rules")
+                and sender_id not in mgr.bot_ids
+            ):
                 client.delete_message(msg["id"])
                 # Send DM to inform user (rate-limited: 60s between DMs)
                 if mgr.can_send_lockdown_dm(sender_id):
                     send_dm(
                         sender_id,
                         "🔒 **New rules have been updated!**\n\n"
-                        "Please type `/agree-new-rules` to accept the new rules and regain the ability to send messages.\n"
+                        "Please type `/agree-new-rules` (or `/agree-with-rules`) in DM or the #Bot channel to accept the new rules and regain the ability to send messages.\n"
                         "This applies to all users, including admins.\n\n"
                         "Thank you for your cooperation!",
                     )
                 return
 
-    # B. Command handling
+    # C. Auto-Rule check (non-command messages, Global: applies to all streams and DMs)
+    if not content.startswith("/"):
+        stream_id = msg.get("stream_id")
+        topic = msg.get("subject", "")
+        auto_match = mgr.match_auto_rules(
+            user_id=sender_id, role=s_role,
+            stream_id=stream_id, topic=topic, content=content,
+        )
+        if auto_match:
+            action = auto_match["action"]
+            rule_id = auto_match["id"]
+            rule_label = f"Auto-Rule #{rule_id}"
+            if auto_match.get("name"):
+                rule_label += f" ({auto_match['name']})"
+
+            if action == "allow":
+                # Allow: message passes through, skip further auto-rules
+                pass
+
+            elif action in ("delete", "warn", "mutewarn"):
+                # Delete the message
+                try:
+                    client.delete_message(msg["id"])
+                except Exception as e:
+                    print(f"Auto-rule delete error: {e}")
+
+                # Build notification for moderators
+                msg_link = ""
+                if msg.get("type") == "stream" and msg.get("stream_id"):
+                    sid = msg["stream_id"]
+                    st = msg.get("subject", "")
+                    msg_link = f"https://chat.p67.click/#narrow/channel/{sid}/topic/{st}/near/{msg['id']}"
+
+                action_icon = {"delete": "🗑️", "warn": "⚠️", "mutewarn": "🔇"}.get(action, "📌")
+                mod_alert = (
+                    f"{action_icon} **{rule_label}** triggered\n"
+                    f"User: @**{sender_name}**\n"
+                    f"Action: `{action}`\n"
+                    f"Pattern: `{auto_match['pattern']}`\n"
+                    f"Match:\n```quote\n{content[:300]}\n```\n"
+                )
+                if msg_link:
+                    mod_alert += f"[Message]({msg_link})\n"
+                if action == "warn":
+                    mod_alert += f"Use `/warn @**{sender_name}** <rule_id> [reason]` to issue a warning.\n"
+                elif action == "mutewarn":
+                    mod_alert += f"This is a silent warn (no DM to user). Use `/warn @**{sender_name}** <rule_id>` if needed.\n"
+                elif action == "delete":
+                    mod_alert += "Message was automatically deleted."
+
+                send_custom(None, mod_alert.strip(), "moderators", "Auto-Rules")
+                return  # Message already deleted, don't process further
+
+    # B. Command handling (Restricted to #Bot stream (id=32) or DMs, so the bot only replies there)
+    is_pm = msg.get("type") == "private"
+    is_bot_stream = (
+        msg.get("type") == "stream" and msg.get("stream_id") == NOTIFICATION_STREAM_ID
+    )
+    if not (is_pm or is_bot_stream):
+        return
+
     if content.startswith("/"):
         cmd = content.split()[0].lower()
 
@@ -1304,58 +1360,6 @@ def handle_message(msg: Dict[str, Any]):
         if handler:
             handler(msg, sender_id, sender_name, content, s_role, t_name, t_id, t_email)
         return
-
-    # C. Auto-Rule check (non-command messages)
-    stream_id = msg.get("stream_id")
-    topic = msg.get("subject", "")
-    auto_match = mgr.match_auto_rules(
-        user_id=sender_id, role=s_role,
-        stream_id=stream_id, topic=topic, content=content,
-    )
-    if auto_match:
-        action = auto_match["action"]
-        rule_id = auto_match["id"]
-        rule_label = f"Auto-Rule #{rule_id}"
-        if auto_match.get("name"):
-            rule_label += f" ({auto_match['name']})"
-
-        if action == "allow":
-            # Allow: message passes through, skip further auto-rules
-            pass
-
-        elif action in ("delete", "warn", "mutewarn"):
-            # Delete the message
-            try:
-                client.delete_message(msg["id"])
-            except Exception as e:
-                print(f"Auto-rule delete error: {e}")
-
-            # Build notification for moderators
-            msg_link = ""
-            if msg.get("type") == "stream" and msg.get("stream_id"):
-                sid = msg["stream_id"]
-                st = msg.get("subject", "")
-                msg_link = f"https://chat.p67.click/#narrow/channel/{sid}/topic/{st}/near/{msg['id']}"
-
-            action_icon = {"delete": "🗑️", "warn": "⚠️", "mutewarn": "🔇"}.get(action, "📌")
-            mod_alert = (
-                f"{action_icon} **{rule_label}** triggered\n"
-                f"User: @**{sender_name}**\n"
-                f"Action: `{action}`\n"
-                f"Pattern: `{auto_match['pattern']}`\n"
-                f"Match:\n```quote\n{content[:300]}\n```\n"
-            )
-            if msg_link:
-                mod_alert += f"[Message]({msg_link})\n"
-            if action == "warn":
-                mod_alert += f"Use `/warn @**{sender_name}** <rule_id> [reason]` to issue a warning.\n"
-            elif action == "mutewarn":
-                mod_alert += f"This is a silent warn (no DM to user). Use `/warn @**{sender_name}** <rule_id>` if needed.\n"
-            elif action == "delete":
-                mod_alert += "Message was automatically deleted."
-
-            send_custom(None, mod_alert.strip(), "moderators", "Auto-Rules")
-            return  # Message already deleted, don't process further
 
     # D. AI moderation removed (2026-08-15)
 

@@ -1,7 +1,7 @@
 import tomllib
 from datetime import datetime, timedelta
 from typing import Any, Dict, Optional, Tuple, cast
-from sqlmodel import Session, select, desc, create_engine
+from sqlmodel import Session, select, desc, create_engine, text
 
 from models import User, WarningRecord, ModLog, PendingConfirmation, AutoRule, NewRulesState
 
@@ -62,6 +62,7 @@ class ModManager:
             state.activated_by = actor_id
             state.activated_by_name = actor_name
             session.add(state)
+            session.exec(text("UPDATE user SET agreed_new_rules = 0"))
             session.commit()
 
     def deactivate_new_rules(self):
