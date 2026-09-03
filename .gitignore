@@ -1,0 +1,21 @@
+# Python 缓存与临时文件
+__pycache__/
+*.py[cod]
+*$py.class
+
+# 虚拟环境
+.venv/
+venv/
+ENV/
+
+# 敏感密钥与本地配置
+.env
+zuliprc
+
+# 本地数据库与临时数据
+*.db
+*.sqlite3
+
+# 备份文件
+*.bak
+*.bak.*
