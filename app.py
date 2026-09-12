@@ -17,30 +17,9 @@ mgr = ModManager()
 BOT_EMAIL = "manage-bot@chat.p67.click"
 MUTE_CONFIRM_THRESHOLD = 7200  # 2 hours in seconds
 
-# ─── 1b. Audit: monkey-patch Client.delete_message / update_message to log every call
-import traceback as _audit_traceback
-_orig_delete = client.delete_message
-_orig_update = client.update_message
-
-
-def _audit_delete(message_id, *args, **kwargs):
-    stack = _audit_traceback.format_stack(limit=8)
-    print(f"[AUDIT delete] msg_id={message_id} args={args} kwargs={kwargs}")
-    for line in stack[-6:]:
-        print(f"  | {line.rstrip()}")
-    return _orig_delete(message_id, *args, **kwargs)
-
-
-def _audit_update(*args, **kwargs):
-    stack = _audit_traceback.format_stack(limit=8)
-    print(f"[AUDIT update] args={args} kwargs={kwargs}")
-    for line in stack[-6:]:
-        print(f"  | {line.rstrip()}")
-    return _orig_update(*args, **kwargs)
-
-
-client.delete_message = _audit_delete
-client.update_message = _audit_update
+# Cross-realm system bots (Zulip built-ins) that get_users() doesn't return
+# but whose messages flow through our event queue. Never apply moderation to them.
+SYSTEM_BOT_IDS = {6, 7}  # Notification Bot, Welcome Bot
 
 # Notification channel (channel id 32 = #Bot)
 NOTIFICATION_STREAM_ID = 32
@@ -1226,6 +1205,10 @@ def handle_message(msg: Dict[str, Any]):
         return
 
     sender_id: int = cast(int, msg.get("sender_id"))
+    # Skip all bots (our realm + cross-realm system bots) — never apply
+    # mute / lockdown / auto-rule moderation to bot messages.
+    if sender_id in mgr.bot_ids or sender_id in SYSTEM_BOT_IDS:
+        return
     sender_name = msg.get("sender_full_name")
     content: str = msg.get("content", "").strip()
 
