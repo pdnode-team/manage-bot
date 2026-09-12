@@ -1288,12 +1288,8 @@ def handle_message(msg: Dict[str, Any]):
                 send_custom(None, mod_alert.strip(), "moderators", "Auto-Rules")
                 return  # Message already deleted, don't process further
 
-    # B. Command handling (Restricted to #Bot stream (id=32) or DMs, so the bot only replies there)
-    is_pm = msg.get("type") == "private"
-    is_bot_stream = (
-        msg.get("type") == "stream" and msg.get("stream_id") == NOTIFICATION_STREAM_ID
-    )
-    if not (is_pm or is_bot_stream):
+    # B. Command handling (Restricted to DMs only — bot only replies there)
+    if msg.get("type") != "private":
         return
 
     if content.startswith("/"):
